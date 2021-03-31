@@ -209,6 +209,16 @@ class PaylineSDK
     const SOAP_WALLET = 'wallet';
 
     /**
+     * directory services endpoint in production environment
+     */
+    const HOMO_SERVICES_ENDPOINT = 'https://homologation-payment.payline.com/services/servicesendpoints/SOAP';
+
+    /**
+     * directory services endpoint in development environment
+     */
+    const PROD_SERVICES_ENDPOINT = 'https://payment.payline.com/services/servicesendpoints/SOAP';
+
+    /**
      * web services endpoint in development environment
      */
     const DEV_ENDPOINT = 'https://ws.dev.payline.com/V4/services/';
@@ -310,6 +320,12 @@ class PaylineSDK
     private $logger;
 
     /**
+     * @var $loggerPath
+     */
+    private $loggerPath;
+
+
+    /**
      * tool / e-commerce module using this library
      */
     private $usedBy = null;
@@ -346,6 +362,10 @@ class PaylineSDK
         'AlertsTrans'              => 'AlertsTransHist'
     );
 
+    protected $servicesEndpoint;
+
+    protected $failvoverOptions= array();
+
     /**
      * PaylineSDK class constructor
      *
@@ -376,18 +396,20 @@ class PaylineSDK
             $merchant_id = (string) $merchant_id;
         }
 
+        $logfileDate = (new \DateTime('now', new \DateTimeZone($defaultTimezone)))->format('Y-m-d');
+        if (empty($pathLog) || !is_dir($pathLog)) {
+            $pathLog = realpath(dirname(dirname(__DIR__))) . DIRECTORY_SEPARATOR . 'logs' . DIRECTORY_SEPARATOR;
+        }
+
+        $this->loggerPath = $pathLog;
         if ($externalLogger) {
             $this->logger = $externalLogger;
         } else {
             $this->logger = new Logger('PaylineSDK');
         }
 
-        $logfileDate = (new \DateTime('now', new \DateTimeZone($defaultTimezone)))->format('Y-m-d');
-        if (is_null($pathLog)) {
-            $this->logger->pushHandler(new StreamHandler(realpath(dirname(dirname(__DIR__))) . DIRECTORY_SEPARATOR . 'logs' . DIRECTORY_SEPARATOR . $logfileDate . '.log', $logLevel)); // set default log folder
-        } elseif (strlen($pathLog) > 0) {
-            $this->logger->pushHandler(new StreamHandler($pathLog . $logfileDate . '.log', $logLevel)); // set custom log folder
-        }
+
+        $this->logger->pushHandler(new StreamHandler($pathLog . $logfileDate . '.log', $logLevel)); // set default log folder
 
         $this->logger->info('__construct', array(
             'merchant_id' => $this->hideChars($merchant_id, 6, 1),
@@ -410,10 +432,12 @@ class PaylineSDK
         $plnInternal = false;
         if (strcmp($environment, self::ENV_HOMO) == 0) {
             $this->webServicesEndpoint = self::HOMO_ENDPOINT;
+            $this->servicesEndpoint = self::HOMO_SERVICES_ENDPOINT . '/' . $merchant_id;
         } elseif (strcmp($environment, self::ENV_HOMO_CC) == 0) {
             $this->webServicesEndpoint = self::HOMO_CC_ENDPOINT;
         } elseif (strcmp($environment, self::ENV_PROD) == 0) {
             $this->webServicesEndpoint = self::PROD_ENDPOINT;
+            $this->servicesEndpoint = self::PROD_SERVICES_ENDPOINT . '/' . $merchant_id;
         } elseif (strcmp($environment, self::ENV_PROD_CC) == 0) {
             $this->webServicesEndpoint = self::PROD_CC_ENDPOINT;
         } elseif (strcmp($environment, self::ENV_DEV) == 0) {
@@ -424,26 +448,41 @@ class PaylineSDK
             $plnInternal = true;
         } else {
             $this->webServicesEndpoint = false; // Exception is raised in PaylineSDK::webServiceRequest
+            $this->servicesEndpoint = false;
         }
-        $this->soapclient_options['style'] = defined('SOAP_DOCUMENT') ? SOAP_DOCUMENT : 2;
-        $this->soapclient_options['use'] = defined('SOAP_LITERAL') ? SOAP_LITERAL : 2;
-        $this->soapclient_options['connection_timeout'] = defined('SOAP_CONNECTION_TIMEOUT') ? SOAP_CONNECTION_TIMEOUT : 5;
-        $this->soapclient_options['trace'] = false;
-        $this->soapclient_options['soap_client'] = false;
-        if($plnInternal){
-            $this->soapclient_options['stream_context'] = stream_context_create(
-                array(
-                    'ssl' => array(
-                        'verify_peer' => false,
-                        'verify_peer_name' => false
-                    )
-                )
+        $this->soapclient_options['trace'] = true;
+        $this->soapclient_options['stream_context_to_create'] = array();
+
+        if ($plnInternal) {
+            $this->soapclient_options['stream_context_to_create']['ssl'] = array(
+                'verify_peer' => false,
+                'verify_peer_name' => false
             );
         }
+
         $this->orderDetails = array();
         $this->privateData = array();
+    }
 
-        ini_set('user_agent', "PHP\r\nversion: " . self::SDK_RELEASE);
+
+    /**
+     * @param $key
+     * @param null $value
+     *
+     * Available options
+     * - disabled => true, false
+     * - cache_pool => file, apc
+     * - cache_file_path => directory path to store file cache
+     * - cache_namespace
+     * - cache_default_ttl
+     */
+    public function setFailvoverOptions($key, $value = null)
+    {
+        if(is_array($key)) {
+            $this->failvoverOptions = $key;
+        } else {
+            $this->failvoverOptions[$key] = $value;
+        }
     }
 
 
@@ -992,12 +1031,23 @@ class PaylineSDK
             if(!$this->webServicesEndpoint){
                 throw new \Exception('Endpoint error (check `environment` parameter of PaylineSDK constructor)');
             }
-            if ($this->soapclient_options['soap_client'] instanceof \SoapClient)  {
-                $client = $this->soapclient_options['soap_client'];
-            } else {
-                $client = new SoapClient(__DIR__ . '/wsdl/' . $PaylineAPI . '.wsdl', $this->soapclient_options);
-            }
-            $client->__setLocation($this->webServicesEndpoint . $PaylineAPI);
+
+            $this->soapclient_options['stream_context_to_create']['http'] = array(
+                'user_agent' => "PHP",
+                'header' => array('version' => $this->usedBy . ' - ' . self::SDK_RELEASE)
+            );
+
+            $client = new WebserviceClient(__DIR__ . '/wsdl/' . $PaylineAPI . '.wsdl', $this->soapclient_options);
+
+            $useFailover = empty($this->failvoverOptions['disabled']);
+
+            $failvoverOptions = array_merge($this->failvoverOptions, array('logger_path'=>$this->loggerPath));
+            $client->setSdkDefaultLocation($this->webServicesEndpoint)
+                ->setSdkAPI($PaylineAPI)
+                ->setUseFailover($useFailover)
+                ->setEndpointsDirectoryLocation($this->servicesEndpoint)
+                ->setFailoverOptions($failvoverOptions);
+
 
             $WSRequest['version'] = isset($array['version']) && strlen($array['version']) ? $array['version'] : '';
             $WSRequest['media'] = isset($array['media']) && strlen($array['media']) ? $array['media'] : '';
@@ -1067,6 +1117,7 @@ class PaylineSDK
                         'payment.contractNumber' => $array['payment']['contractNumber'],
                         'payment.amount' => $array['payment']['amount']
                     );
+
                     $response = self::responseToArray($client->doAuthorization($WSRequest));
                     $logResponse['transaction.id'] = $response['transaction']['id'];
                     break;
@@ -1354,7 +1405,6 @@ class PaylineSDK
     public function usedBy($toolName)
     {
         $this->usedBy = $toolName;
-        ini_set('user_agent', "PHP\r\nversion: " . $toolName . ' - ' . self::SDK_RELEASE);
     }
 
     /**
